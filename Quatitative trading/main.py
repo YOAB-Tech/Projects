@@ -29,20 +29,21 @@ class Stock:
             progress=True,session = session)
         self.data.to_sql(self.name,conn,if_exists='append')
     def loadfromdatabase(self): ##load the stock data from stock.db, return False if there's now existing corresponding table
-        table_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '?",(self.name,)).fetchone()
+        table_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",(self.name,)).fetchone()
         if table_exists is None:
             return False
-        self.data = pd.read_sql_table(table_name=self.name,
-                                      con=conn,
-                                      parse_dates=["Date"],
-                                      index_col="Date")
+        self.data = pd.read_sql_query(
+            f'SELECT * FROM {self.name}',
+            conn,
+            parse_dates = ["Date"],
+            index_col = "Date",
+        )
         return True
     def calculateMA(self,days: list[int]): ## calculate mA 5 for example
         data = self.data
         for i in days:
             add = "MA{}".format(i)
             data[add] = self.data["Close"].rolling(window = i).mean()
-        self.data.to_sql(self.name, conn, if_exists='append')
     def calculateMACD(self,days: list[int]):
         data = self.data
         if len(days)!=3:
@@ -61,8 +62,11 @@ class Stock:
         self.data["deadcross"] = (
             (dif < dea) & (dif.shift(1) >= dea.shift(1))
         )
-        self.data.to_sql(self.name, conn, if_exists='append')
-
+    def calculateVMA(self,days:list[int]):
+        data = self.data
+        for i in days:
+            add = "VMA{}".format(i)
+            data[add] = self.data["Volume"].rolling(window = i).mean()
 ## Strategy
 ##strategy stimulation all in one
 class Strategy:
@@ -72,7 +76,6 @@ class Strategy:
         self.factors = factors ## such as "macd" : 0, "upsell": 15, "downsell": 15
         self.money = money
         self.totalprofit = 0 ##totalprofit
-        self.profit = {} ## store to expense of each stocks
         self.transactions = pd.DataFrame(columns = ["averageprice","volume","date","profit"]) ## name as index, indicating average price and v etc. for each stock
         self.operations = pd.DataFrame(columns = ["name","date","price", "volume","buy","totalprice"]) ##dataframe storing comprehensive transaction details
 
@@ -83,8 +86,8 @@ class Strategy:
             self.update(stock)
             stock.calculateMACD([10,23,8])
             stock.calculateMA(days = [5,20])
-            self.transactions.iloc[len(self.transactions)] = [0,0,pd.Timestamp.today().normalize(),0]
-            self.transactions.index[len(self.transactions)] = stock.name## initialize transactions dataframe, add more attributes later
+            self.transactions.loc[stock.name] = [0,0,pd.Timestamp.today().normalize(),0]
+            ## initialize transactions dataframe, add more attributes later
     def update(self, st):  ##handle the case where the data is stale
         st.loadfromdatabase()
         latest_date = st.data.index.max()
@@ -114,10 +117,13 @@ class Strategy:
             conn.commit()
             st.data = pd.concat([st.data,new_data]).sort_index()
     def buy(self, chosenstock: Stock,date: int, price: float, volume: int) -> bool:
+        if volume == 0:
+            return False
         if self.money < price * volume*100:
             print("run out of money")
             return False
         self.money -= price*volume*100
+        self.totalprofit -= price*volume*100
         sn = chosenstock.name
         ## modifying transactions
         newrow = {"name": chosenstock.name,"date" : chosenstock.data.index[date],"price" : price,"volume" : volume*100,"buy" : True}
@@ -134,41 +140,70 @@ class Strategy:
         actualdate = chosenstock.data.index[date]
         print(f"Buy {name} at {actualdate}, {volume} in price {price}")
         return True
-    ##take the list of price and list of volume as corresponding pairs for operation
     def sell(self, chosenstock: Stock, date: int, price: float, volume: int) -> bool:
-        if volume*100 > self.transactions[chosenstock][1]:
+        if volume == 0:
+            return False
+        sn = chosenstock.name
+        if volume*100 > self.transactions.loc[sn,"volume"]:
             print("volume exceeds")
             return False
         self.money += price*volume*100
         self.totalprofit += price * volume*100
-        self.profit[chosenstock] += price*volume*100
+        self.transactions.loc[sn, "profit"] += price * volume * 100
         newrow = {"name": chosenstock.name,"date" : chosenstock.data.index[date],"price" : price,"volume" : volume*100,"buy" : False}
-        self.operations = self.operations.concat([self.operations,newrow],index_ignore = True)
-        self.transactions[chosenstock][1] -= volume*100
-        if self.transactions[chosenstock][1] == 0:
-            self.transactions[chosenstock] = [0,0,0]
+        self.operations = pd.concat([self.operations,pd.DataFrame([newrow])],ignore_index = True)
+        lastindex = self.operations.index[-1]
+        self.operations.loc[lastindex, "totalprice"] = -price * volume * 100
+        old_volume = self.transactions.loc[sn,"volume"]
+        old_price = self.transactions.loc[sn,"averageprice"]
+        self.transactions.loc[sn,"volume"] -=volume*100
+        if volume*100 == old_volume:
+            self.transactions.loc[sn,"averageprice"] = 0
         name = chosenstock.name
         actualdate = chosenstock.data.index[date]
         print(f"Sell {name} at {actualdate}, {volume} in price {price}")
         return True
+
+    ##read the factor and execute it to get the corresponding data
     def readandexecute(self):
-        for st in self.port:
-            st.data = st.data.sort_index()
-            for i in range(len(st.data)):
-                row = st.data.iloc[i]
-                if i == 0:
+        all_dates = sorted(set().union(*(set(stock.data.index)for stock in self.port)))
+        for i in all_dates:
+            for st in self.port:
+                if i not in st.data.index:
                     continue
-                if st.data.iloc[i-1]["goldencross"] and (-0.1<st.data.iloc[i-1]["DIF"]<0.1): ##golden cross buy
-                    if i >= len(st.data):
+                st.data = st.data.sort_index()
+                ##rl --> real index ( im too lazy to change i to date)
+                rl = st.data.index.get_loc(i)
+                if rl == 0:
+                    continue
+                row = st.data.iloc[rl]
+    ##===============buy operation===================================
+                if st.data.iloc[rl-1]["goldencross"] and (-0.1<st.data.iloc[rl-1]["DIF"]<0.1): ##golden cross buy
+                    if rl >= len(st.data):
                         continue
-                    price = st.data.iloc[i]["Open"]
-                    if price > st.data.iloc[i-1]["Close"] * 0.99:
-                        self.buy(st,i,price,1) ## again using factors
-                if self.transactions[st][1] > 0 and i > self.transactions[st][2]: ## if price > the average price of the holding price then sold all
+                    price = row["Open"]
+                    if price > st.data.iloc[rl-1]["Close"] * 0.99:
+                        self.buy(st,rl,price,round((self.money/len(self.port))/(price*100))) ## again using factors
+                if st.data.iloc[rl]["Open"] < st.data.iloc[rl-1]["Low"] and st.data.iloc[rl]["Close"] > st.data.iloc[rl-1]["High"]:
+                    price = row["Open"]
+                    if rl +1>= len(st.data):
+                        continue
+                    self.buy(st,rl+1,st.data.iloc[rl+1]["Open"],round((self.money/len(self.port))/(price*100)))
+    ##================sell determination====================================
+                if self.transactions.loc[st.name,"volume"] > 0 and i > self.transactions.loc[st.name,"date"]: ## if price > the average price of the holding price then sold all
+                    boughtprice = self.transactions.loc[st.name,"averageprice"]
+                    volume = self.transactions.loc[st.name,"volume"]
                     high = row["High"]
                     low = row["Low"]
-                    if high > self.transactions[st][0]*1.15 > low: ## really sell the stock by the factor given
-                        self.sell(st,i,self.transactions[st][0]*1.15,self.transactions[st][1]//100)
+                    if high > boughtprice*1.15 > low: ## really sell the stock by the factor given
+                           ##add the factor later, now just define the strategy myself
+                        self.sell(st,rl,boughtprice*1.15,round((volume//100)*0.6))
+                    if low>= boughtprice*1.15:
+                        self.sell(st,rl,low,round((volume//100)*0.6))
+                    if low< boughtprice * 0.92 < high:
+                        self.sell(st,rl,boughtprice*0.92,volume//100)
+                    if high< boughtprice * 0.92 :
+                        self.sell(st,rl,high,volume//100)
 
 
 
