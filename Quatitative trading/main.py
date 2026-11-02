@@ -3,6 +3,7 @@ import yfinance as yf
 import sqlite3
 import pandas as pd
 from curl_cffi import requests
+import random
 import seaborn as sns
 import matplotlib.pyplot as plt
 session = requests.Session(impersonate='chrome')
@@ -192,18 +193,25 @@ class Strategy:
     ##================sell determination====================================
                 if self.transactions.loc[st.name,"volume"] > 0 and i > self.transactions.loc[st.name,"date"]: ## if price > the average price of the holding price then sold all
                     boughtprice = self.transactions.loc[st.name,"averageprice"]
+                    target = boughtprice * 1.15
+                    stop = boughtprice * 0.92
                     volume = self.transactions.loc[st.name,"volume"]
                     high = row["High"]
                     low = row["Low"]
-                    if high > boughtprice*1.15 > low: ## really sell the stock by the factor given
-                           ##add the factor later, now just define the strategy myself
-                        self.sell(st,rl,boughtprice*1.15,round((volume//100)*0.6))
-                    if low>= boughtprice*1.15:
-                        self.sell(st,rl,low,round((volume//100)*0.6))
-                    if low< boughtprice * 0.92 < high:
-                        self.sell(st,rl,boughtprice*0.92,volume//100)
-                    if high< boughtprice * 0.92 :
-                        self.sell(st,rl,high,volume//100)
+                    open_price = row["Open"]
+                    lots = int(volume//100)
+                    partiallots = max(1, int(lots * 0.6)) if lots else 0
+                    if open_price <= stop:
+                        self.sell(st,rl,open_price,lots)
+                    elif open_price >= target:
+                        if partiallots > 0:
+                            self.sell(st,rl,open_price,partiallots)
+                    elif low <= stop:
+                        self.sell(st,rl,stop,lots)
+                    elif high >= target:
+                        if partiallots > 0:
+                            self.sell(st,rl,target,partiallots)
+
 
 
 
