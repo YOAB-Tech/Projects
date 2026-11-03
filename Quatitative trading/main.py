@@ -22,23 +22,30 @@ class Stock:
         self.data = data
         self.name = name
     def download(self,timespan):##imput the string of time span, ##download new data (purely)
-        self.data = yf.download(
+        data = yf.download(
             stockdic[self.name],
             period=timespan,
             multi_level_index=False,
             auto_adjust=True,
             progress=True,session = session)
-        self.data.to_sql(self.name,conn,if_exists='append')
+        if data is None or data.empty:
+            raise RuntimeError(f'Stock {self.name} not available')
+        self.data = data.sort_index()
+        self.data.to_sql(self.name,conn,if_exists='replace',index = True, index_label="Date")
+        conn.commit()
     def loadfromdatabase(self): ##load the stock data from stock.db, return False if there's now existing corresponding table
         table_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",(self.name,)).fetchone()
         if table_exists is None:
             return False
-        self.data = pd.read_sql_query(
+        data = pd.read_sql_query(
             f'SELECT * FROM {self.name}',
             conn,
             parse_dates = ["Date"],
             index_col = "Date",
         )
+        if data.empty:
+            return False
+        self.data = data.sort_index()
         return True
     def calculateMA(self,days: list[int]): ## calculate mA 5 for example
         data = self.data
@@ -50,10 +57,10 @@ class Stock:
         if len(days)!=3:
             print("MACD requires only 3 factors")
             return
-        emafirst = self.data["Close"].ewm(span = days[0], adjust = True).mean()
-        emasecond = self.data["Close"].ewm(span = days[1], adjust = True).mean()
+        emafirst = self.data["Close"].ewm(span = days[0], adjust = False).mean()
+        emasecond = self.data["Close"].ewm(span = days[1], adjust = False).mean()
         dif = emafirst - emasecond
-        dea = dif.ewm(span = days[2], adjust = True).mean()
+        dea = dif.ewm(span = days[2], adjust = False).mean()
         self.data["DIF"] =dif
         self.data["DEA"] =dea
         self.data["MACD"] = 2*(dif-dea)
@@ -71,26 +78,48 @@ class Stock:
 ## Strategy
 ##strategy stimulation all in one
 class Strategy:
-    def __init__(self,port: list[Stock], timespan: int, factors: dict, money: int ):
+    def __init__(self,port: list[Stock], timespan: str, money: int, factorusage : list[str],stop = 0.92 , target = 1.15, macd = 0.1):
         self.port = port
-        self.timespan = timespan
-        self.factors = factors ## such as "macd" : 0, "upsell": 15, "downsell": 15
+        self.timespan = timespan## such as "macd" : 0, "upsell": 15, "downsell": 15
         self.money = money
+        self.initial_money = money
+        self.macd = macd
+        self.factorusage = factorusage
+        self.target = target
+        self.stop = stop
+        self.equity_curve = pd.DataFrame(columns=["cash","position_value","portfolio_value","profit",]) ##record the panorama of trades
         self.totalprofit = 0 ##totalprofit
-        self.transactions = pd.DataFrame(columns = ["averageprice","volume","date","profit"]) ## name as index, indicating average price and v etc. for each stock
-        self.operations = pd.DataFrame(columns = ["name","date","price", "volume","buy","totalprice"]) ##dataframe storing comprehensive transaction details
+        self.transactions = pd.DataFrame({
+            "averageprice": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="int64"),
+            "date": pd.Series(dtype="datetime64[ns]"),
+            "profit": pd.Series(dtype="float64"),
+        })
+        ## name as index, indicating bought average price and bought v newest bought date, and totalprofit for each stock
+        self.operations = pd.DataFrame({
+            "name": pd.Series(dtype="object"),
+            "date": pd.Series(dtype="datetime64[ns]"),
+            "price": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="int64"),
+            "buy": pd.Series(dtype="bool"),
+            "totalprice": pd.Series(dtype="float64"),
+        })
+        ##dataframe storing comprehensive transaction details
 
     def initialize(self):
         for stock in self.port:
-            if not stock.loadfromdatabase():
-                stock.download(timespan = self.timespan)
-            self.update(stock)
+            loaded = stock.loadfromdatabase()
+            if loaded:
+                self.update(stock)
+            else:
+                stock.download(timespan=self.timespan)
             stock.calculateMACD([10,23,8])
             stock.calculateMA(days = [5,20])
-            self.transactions.loc[stock.name] = [0,0,pd.Timestamp.today().normalize(),0]
+            self.transactions.loc[stock.name] = [0.0,0,pd.Timestamp.today().normalize(),0.0]
             ## initialize transactions dataframe, add more attributes later
     def update(self, st):  ##handle the case where the data is stale
-        st.loadfromdatabase()
+        if not st.loadfromdatabase():
+            return False
         latest_date = st.data.index.max()
         next_date = latest_date + pd.Timedelta(days=1)
         today = pd.Timestamp.today().normalize()
@@ -105,7 +134,7 @@ class Strategy:
             session=session,
         )
         if new_data.empty:
-            return
+            return True
         new_data = new_data[new_data.index > latest_date]
         if not new_data.empty:
             new_data.to_sql(
@@ -117,6 +146,7 @@ class Strategy:
             )
             conn.commit()
             st.data = pd.concat([st.data,new_data]).sort_index()
+        return True
     def buy(self, chosenstock: Stock,date: int, price: float, volume: int) -> bool:
         if volume == 0:
             return False
@@ -139,7 +169,8 @@ class Strategy:
         self.transactions.loc[sn,"profit"] -= price*volume*100
         name = chosenstock.name
         actualdate = chosenstock.data.index[date]
-        print(f"Buy {name} at {actualdate}, {volume} in price {price}")
+        print(f"Buy {name} at {actualdate}, {volume} in price {price}, total price {volume*100*price}")
+        print(self.totalprofit)
         return True
     def sell(self, chosenstock: Stock, date: int, price: float, volume: int) -> bool:
         if volume == 0:
@@ -162,12 +193,21 @@ class Strategy:
             self.transactions.loc[sn,"averageprice"] = 0
         name = chosenstock.name
         actualdate = chosenstock.data.index[date]
-        print(f"Sell {name} at {actualdate}, {volume} in price {price}")
+        print(f"Sell {name} at {actualdate}, {volume} in price {price}, total price {volume*100*price}")
+        print(self.totalprofit)
         return True
+    def prepare_closing_price(self,all_dates):
+        closing_prices = pd.DataFrame({st.name:st.data['Close']
+                                       for st in self.port})
+        closing_prices = closing_prices.sort_index()
+        closing_prices = closing_prices.reindex(all_dates).ffill()
+        return closing_prices
 
     ##read the factor and execute it to get the corresponding data
     def readandexecute(self):
         all_dates = sorted(set().union(*(set(stock.data.index)for stock in self.port)))
+        closing_prices = self.prepare_closing_price(all_dates)
+        minimum_history = 34
         for i in all_dates:
             for st in self.port:
                 if i not in st.data.index:
@@ -175,42 +215,99 @@ class Strategy:
                 st.data = st.data.sort_index()
                 ##rl --> real index ( im too lazy to change i to date)
                 rl = st.data.index.get_loc(i)
-                if rl == 0:
+                if rl < minimum_history:
                     continue
                 row = st.data.iloc[rl]
+                previous = st.data.iloc[rl-1]
+                before_previous = st.data.iloc[rl-2]
     ##===============buy operation===================================
-                if st.data.iloc[rl-1]["goldencross"] and (-0.1<st.data.iloc[rl-1]["DIF"]<0.1): ##golden cross buy
-                    if rl >= len(st.data):
-                        continue
-                    price = row["Open"]
-                    if price > st.data.iloc[rl-1]["Close"] * 0.99:
-                        self.buy(st,rl,price,round((self.money/len(self.port))/(price*100))) ## again using factors
-                if st.data.iloc[rl]["Open"] < st.data.iloc[rl-1]["Low"] and st.data.iloc[rl]["Close"] > st.data.iloc[rl-1]["High"]:
-                    price = row["Open"]
-                    if rl +1>= len(st.data):
-                        continue
-                    self.buy(st,rl+1,st.data.iloc[rl+1]["Open"],round((self.money/len(self.port))/(price*100)))
+                macd_signal = (
+                        "macd" in self.factorusage
+                        and previous["goldencross"]
+                        and -self.macd < previous["DIF"] < self.macd
+                        and row["Open"] >= previous["Close"] * 0.99
+                )
+                devour_signal = (
+                        "devour" in self.factorusage
+                        and previous["Open"] <= before_previous["Low"]
+                        and previous["Close"] >= before_previous["High"]
+                )
+                if macd_signal or devour_signal:
+                    entry_price = row["Open"]
+                    volume = int((self.money/len(self.port))/(entry_price*100))
+                    if volume > 0:
+                        self.buy(st,rl,entry_price,volume)
     ##================sell determination====================================
                 if self.transactions.loc[st.name,"volume"] > 0 and i > self.transactions.loc[st.name,"date"]: ## if price > the average price of the holding price then sold all
                     boughtprice = self.transactions.loc[st.name,"averageprice"]
-                    target = boughtprice * 1.15
-                    stop = boughtprice * 0.92
+                    targetprice = boughtprice * self.target
+                    stopprice = boughtprice * self.stop
                     volume = self.transactions.loc[st.name,"volume"]
                     high = row["High"]
                     low = row["Low"]
                     open_price = row["Open"]
                     lots = int(volume//100)
-                    partiallots = max(1, int(lots * 0.6)) if lots else 0
-                    if open_price <= stop:
+                    partiallots = max(1, int(lots)) if lots else 0
+                    if open_price <= stopprice:
                         self.sell(st,rl,open_price,lots)
-                    elif open_price >= target:
+                    elif open_price >= targetprice:
                         if partiallots > 0:
                             self.sell(st,rl,open_price,partiallots)
-                    elif low <= stop:
-                        self.sell(st,rl,stop,lots)
-                    elif high >= target:
+                    elif low <= stopprice:
+                        self.sell(st,rl,stopprice,lots)
+                    elif high >= targetprice:
                         if partiallots > 0:
-                            self.sell(st,rl,target,partiallots)
+                            self.sell(st,rl,targetprice,partiallots)
+    ##==================calculating position value=============================
+            position_value = 0.0
+            for st in self.port:
+                shares = self.transactions.loc[st.name,"volume"]
+                close = closing_prices.loc[i,st.name]
+                if pd.notna(close):
+                    position_value += shares*close
+            portfolio_value = position_value+self.money
+            self.equity_curve.loc[i] = [
+                self.money,
+                position_value,
+                portfolio_value,
+                portfolio_value-self.initial_money,
+            ]
+    def showresult(self):
+        fig, ax = plt.subplots(figsize=(12,6))
+        ax.plot(
+            self.equity_curve.index,
+            self.equity_curve["portfolio_value"],
+            label = "Portfolio Value",
+        )
+        ax.plot(
+            self.equity_curve.index,
+            self.equity_curve["cash"],
+            label = "Cash",
+        )
+        ax.plot(
+            self.equity_curve.index,
+            self.equity_curve["profit"],
+            label = "Profit",
+        )
+        ax.set_title("Portfolio perfomance")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Value")
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+def backtest():
+    teststocklist = []
+    for i in stockdic.keys():
+        teststocklist.append(Stock(i))
+    teststrategy = Strategy(teststocklist,"2y",100000,["macd","devour"])
+    teststrategy.initialize()
+    teststrategy.readandexecute()
+    teststrategy.showresult()
+if __name__ == "__main__":
+    backtest()
+
+
 
 
 
