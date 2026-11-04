@@ -21,6 +21,9 @@ class Stock:
     def __init__(self,name,data = None):
         self.data = data
         self.name = name
+    def committodatabase(self):
+        self.data.to_sql(self.name,conn,if_exists='replace',index = True, index_label="Date")
+        conn.commit()
     def download(self,timespan):##imput the string of time span, ##download new data (purely)
         data = yf.download(
             stockdic[self.name],
@@ -31,8 +34,6 @@ class Stock:
         if data is None or data.empty:
             raise RuntimeError(f'Stock {self.name} not available')
         self.data = data.sort_index()
-        self.data.to_sql(self.name,conn,if_exists='replace',index = True, index_label="Date")
-        conn.commit()
     def loadfromdatabase(self): ##load the stock data from stock.db, return False if there's now existing corresponding table
         table_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",(self.name,)).fetchone()
         if table_exists is None:
@@ -47,6 +48,31 @@ class Stock:
             return False
         self.data = data.sort_index()
         return True
+    def update(self):  ##handle the case where the data is stale
+        if not self.loadfromdatabase():
+            return False
+        latest_date = self.data.index.max()
+        next_date = latest_date + pd.Timedelta(days=1)
+        today = pd.Timestamp.today().normalize()
+        if next_date > today:
+            return
+        new_data = yf.download(
+            stockdic[self.name],
+            start=next_date,
+            end=(today + pd.Timedelta(days=1)),
+            multi_level_index=False,
+            progress=False,
+            session=session,
+        )
+        if new_data.empty:
+            return True
+        new_data = new_data[new_data.index > latest_date]
+        self.data = pd.concat([self.data,new_data]).sort_index()
+        return True
+    def calculateallIndex(self,macd = [10,23,8],ma = [5,20],vma = [5,20]):
+        self.calculateMACD(macd)
+        self.calculateMA(ma)
+        self.calculateVMA(vma)
     def calculateMA(self,days: list[int]): ## calculate mA 5 for example
         data = self.data
         for i in days:
@@ -78,12 +104,17 @@ class Stock:
 ## Strategy
 ##strategy stimulation all in one
 class Strategy:
-    def __init__(self,port: list[Stock], timespan: str, money: int, factorusage : list[str],stop = 0.92 , target = 1.15, macd = 0.1):
+    def __init__(self,port: list[Stock], timespan: str, money: int, factorusage : list[str],
+                 stop = 0.92 , target = 1.15, macd = 0.1,ma_calculation = (5,20),
+                 macd_calculation = (10,23,8),vma_calculation = (5,20)):
         self.port = port
         self.timespan = timespan## such as "macd" : 0, "upsell": 15, "downsell": 15
         self.money = money
         self.initial_money = money
         self.macd = macd
+        self.ma_calculation = list(ma_calculation)
+        self.vma_calculation = list(vma_calculation)
+        self.macd_calculation = list(macd_calculation)
         self.factorusage = factorusage
         self.target = target
         self.stop = stop
@@ -110,43 +141,13 @@ class Strategy:
         for stock in self.port:
             loaded = stock.loadfromdatabase()
             if loaded:
-                self.update(stock)
+                stock.update()
             else:
                 stock.download(timespan=self.timespan)
-            stock.calculateMACD([10,23,8])
-            stock.calculateMA(days = [5,20])
+            stock.calculateallIndex(macd = self.macd_calculation, ma = self.ma_calculation, vma = self.vma_calculation)
+            stock.committodatabase()
             self.transactions.loc[stock.name] = [0.0,0,pd.Timestamp.today().normalize(),0.0]
             ## initialize transactions dataframe, add more attributes later
-    def update(self, st):  ##handle the case where the data is stale
-        if not st.loadfromdatabase():
-            return False
-        latest_date = st.data.index.max()
-        next_date = latest_date + pd.Timedelta(days=1)
-        today = pd.Timestamp.today().normalize()
-        if next_date > today:
-            return
-        new_data = yf.download(
-            stockdic[st.name],
-            start=next_date,
-            end=(today + pd.Timedelta(days=1)),
-            multi_level_index=False,
-            progress=False,
-            session=session,
-        )
-        if new_data.empty:
-            return True
-        new_data = new_data[new_data.index > latest_date]
-        if not new_data.empty:
-            new_data.to_sql(
-                st.name,
-                conn,
-                if_exists='append',
-                index = True,
-                index_label="Date"
-            )
-            conn.commit()
-            st.data = pd.concat([st.data,new_data]).sort_index()
-        return True
     def buy(self, chosenstock: Stock,date: int, price: float, volume: int) -> bool:
         if volume == 0:
             return False
@@ -194,7 +195,7 @@ class Strategy:
         name = chosenstock.name
         actualdate = chosenstock.data.index[date]
         print(f"Sell {name} at {actualdate}, {volume} in price {price}, total price {volume*100*price}")
-        print(self.totalprofit)
+        print(f"Current profit{int(self.totalprofit)}, {int(self.money)}remains")
         return True
     def prepare_closing_price(self,all_dates):
         closing_prices = pd.DataFrame({st.name:st.data['Close']
@@ -202,7 +203,6 @@ class Strategy:
         closing_prices = closing_prices.sort_index()
         closing_prices = closing_prices.reindex(all_dates).ffill()
         return closing_prices
-
     ##read the factor and execute it to get the corresponding data
     def readandexecute(self):
         all_dates = sorted(set().union(*(set(stock.data.index)for stock in self.port)))
@@ -225,6 +225,10 @@ class Strategy:
                         "macd" in self.factorusage
                         and previous["goldencross"]
                         and -self.macd < previous["DIF"] < self.macd
+                        and before_previous["DEA"] < 0.5 ##ensure the purchase is after a sudden golden cross
+                        and before_previous["DIF"] < 0.5
+                        and previous["VMA{}".format(self.vma_calculation[0])] > previous["VMA{}".format(self.vma_calculation[1])]
+                        and before_previous["VMA{}".format(self.vma_calculation[0])] <= before_previous["VMA{}".format(self.vma_calculation[1])]
                         and row["Open"] >= previous["Close"] * 0.99
                 )
                 devour_signal = (
@@ -232,13 +236,27 @@ class Strategy:
                         and previous["Open"] <= before_previous["Low"]
                         and previous["Close"] >= before_previous["High"]
                 )
-                if macd_signal or devour_signal:
+                ma_signal = ( ##golden cross for MA
+                    "ma" in self.factorusage
+                    and previous["MA{}".format(self.ma_calculation[0])]>=previous["MA{}".format(self.ma_calculation[1])]
+                    and before_previous["MA{}".format(self.ma_calculation[0])]<=before_previous["MA{}".format(self.ma_calculation[1])]
+                )
+                if macd_signal or devour_signal or ma_signal:
                     entry_price = row["Open"]
                     volume = int((self.money/len(self.port))/(entry_price*100))
                     if volume > 0:
                         self.buy(st,rl,entry_price,volume)
     ##================sell determination====================================
                 if self.transactions.loc[st.name,"volume"] > 0 and i > self.transactions.loc[st.name,"date"]: ## if price > the average price of the holding price then sold all
+                    reversed_devour_signal = (
+                            previous["Open"] >= before_previous["High"]
+                            and previous["Close"] <= before_previous["Low"]
+                    )
+                    macd_signal = (
+                        "macd" in self.factorusage
+                        and previous["deadcross"]
+                        and (previous["DEA"] < -0.5 or previous["DEA"] > 0.5)
+                    )
                     boughtprice = self.transactions.loc[st.name,"averageprice"]
                     targetprice = boughtprice * self.target
                     stopprice = boughtprice * self.stop
@@ -248,6 +266,8 @@ class Strategy:
                     open_price = row["Open"]
                     lots = int(volume//100)
                     partiallots = max(1, int(lots)) if lots else 0
+                    if reversed_devour_signal or macd_signal: ##make stop of losing
+                        self.sell(st,rl,open_price,lots)
                     if open_price <= stopprice:
                         self.sell(st,rl,open_price,lots)
                     elif open_price >= targetprice:
@@ -272,6 +292,9 @@ class Strategy:
                 portfolio_value,
                 portfolio_value-self.initial_money,
             ]
+        p = 0
+        monthly_profit = self.equity_curve["profit"].resample("ME").last().diff()
+        print(monthly_profit)
     def showresult(self):
         fig, ax = plt.subplots(figsize=(12,6))
         ax.plot(
@@ -300,7 +323,7 @@ def backtest():
     teststocklist = []
     for i in stockdic.keys():
         teststocklist.append(Stock(i))
-    teststrategy = Strategy(teststocklist,"2y",100000,["macd","devour"])
+    teststrategy = Strategy(teststocklist,"2y",100000,["macd","devour","ma"])
     teststrategy.initialize()
     teststrategy.readandexecute()
     teststrategy.showresult()
