@@ -3,10 +3,30 @@ import yfinance as yf
 import sqlite3
 import pandas as pd
 from curl_cffi import requests
+import re
 import random
 import seaborn as sns
 import matplotlib.pyplot as plt
 session = requests.Session(impersonate='chrome')
+
+#=================================helper function=============================
+def period_start(period:str,end_date = None):
+    match = re.fullmatch(r"(\d+)(d|wk|mo|y)", period.lower())
+    if match is None:
+        raise ValueError(f"Invalid period {period}")
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if end_date is None:
+        end_date = pd.Timestamp.today().normalize()
+    else:
+        end_date = pd.Timestamp(end_date)
+    offsets = {
+        "d": pd.Timedelta(days=amount),
+        "wk": pd.Timedelta(weeks=amount),
+        "mo": pd.DateOffset(months=amount),
+        "y": pd.DateOffset(years=amount),
+    }
+    return end_date - offsets[unit]
 
 stockdic = {}
 stocks = ['601138.SS', '601600.SS','002475.SZ','000988.SZ','603920.SS']
@@ -15,12 +35,16 @@ stockdic['zgly'] = stocks[1]
 stockdic['lxjm'] = stocks[2]
 stockdic['hgkj'] = stocks[3]
 stockdic['sydl'] = stocks[4]
+stockindex = ['szzs', 'szcz', 'kczj', 'cybz']
+stockdic.update({'szzs': '000001.SS','szcz': '399001.SZ','kczj':'000680.SS','cybz':'399006.SZ'})
 conn = sqlite3.connect('stocks.db')
 ##class stock, take real name in
 class Stock:
-    def __init__(self,name,data = None):
+    def __init__(self,name:str,data = None):
         self.data = data
         self.name = name
+        self.buyindicator = 0
+        self.sellindicator = 0
     def committodatabase(self):
         self.data.to_sql(self.name,conn,if_exists='replace',index = True, index_label="Date")
         conn.commit()
@@ -69,48 +93,62 @@ class Stock:
         new_data = new_data[new_data.index > latest_date]
         self.data = pd.concat([self.data,new_data]).sort_index()
         return True
-    def calculateallIndex(self,macd = [10,23,8],ma = [5,20],vma = [5,20]):
-        self.calculateMACD(macd)
-        self.calculateMA(ma)
-        self.calculateVMA(vma)
-    def calculateMA(self,days: list[int]): ## calculate mA 5 for example
-        data = self.data
-        for i in days:
-            add = "MA{}".format(i)
-            data[add] = self.data["Close"].rolling(window = i).mean()
-    def calculateMACD(self,days: list[int]):
-        data = self.data
-        if len(days)!=3:
-            print("MACD requires only 3 factors")
-            return
-        emafirst = self.data["Close"].ewm(span = days[0], adjust = False).mean()
-        emasecond = self.data["Close"].ewm(span = days[1], adjust = False).mean()
-        dif = emafirst - emasecond
-        dea = dif.ewm(span = days[2], adjust = False).mean()
-        self.data["DIF"] =dif
-        self.data["DEA"] =dea
-        self.data["MACD"] = 2*(dif-dea)
-        self.data["goldencross"] = (
-            (dif > dea) & (dif.shift(1) <= dea.shift(1))
+    def calculateallIndex(self,macd = [10,23,8],ma = [5,20],vma = [5,20],start_timestamp = None, warmup = 200):
+        self.data = self.data.sort_index()
+        if start_timestamp is None:
+            start_pos = 0
+        else:
+            start_time = pd.Timestamp(start_timestamp)
+            start_pos = self.data.index.searchsorted(start_time,side = "left")
+        if start_pos >= len(self.data):
+            return self.data.iloc[0:0].copy()
+        calculation_start = max(0,start_pos-warmup)
+        calculation_data = self.data.iloc[calculation_start:].copy()
+        close = calculation_data["Close"]
+        volume =calculation_data["Volume"]
+        #===================================MA and VMA calculation=================================
+        for i in ma:
+            calculation_data[f"MA{i}"] = close.rolling(window = i).mean()
+        for i in vma:
+            calculation_data[f"VMA{i}"] = volume.rolling(window = i).mean()
+        #===================================MACD calculation========================================
+        if len(macd)!=3:
+            raise ValueError("MACD requires 3 factors")
+        ema_fast = close.ewm(span = macd[0], adjust = False).mean()
+        ema_slow = close.ewm(span = macd[1], adjust = False).mean()
+        dif = ema_fast - ema_slow
+        dea = dif.ewm(span = macd[2], adjust = False).mean()
+        calculation_data["DIF"] = dif
+        calculation_data["DEA"] = dea
+        calculation_data["MACD"] = 2 * (dif-dea)
+        calculation_data["goldencross"] = (
+        (dif > dea) & (dif.shift(1) <= dea.shift(1))
         )
-        self.data["deadcross"] = (
-            (dif < dea) & (dif.shift(1) >= dea.shift(1))
+        calculation_data["deadcross"] = (
+        (dif < dea) & (dif.shift(1) >= dea.shift(1))
         )
-    def calculateVMA(self,days:list[int]):
-        data = self.data
-        for i in days:
-            add = "VMA{}".format(i)
-            data[add] = self.data["Volume"].rolling(window = i).mean()
+        for column in ("goldencross", "deadcross"):
+            if column in self.data.columns:
+                self.data[column] = (
+                    self.data[column]
+                    .fillna(False)
+                    .astype(bool)
+                )
+        result = calculation_data.iloc[start_pos-calculation_start:].copy()
+        for column in result.columns:
+            self.data.loc[result.index,column] = result[column]
+        return result
 ## Strategy
 ##strategy stimulation all in one
 class Strategy:
     def __init__(self,port: list[Stock], timespan: str, money: int, factorusage : list[str],
-                 stop = 0.92 , target = 1.15, macd = 0.1,ma_calculation = (5,20),
+                 stop = 0.92 , target = 1.15, macd = [0.1,0.5],ma_calculation = (5,20),
                  macd_calculation = (10,23,8),vma_calculation = (5,20)):
         self.port = port
         self.timespan = timespan## such as "macd" : 0, "upsell": 15, "downsell": 15
         self.money = money
         self.initial_money = money
+        self.start_date = period_start(timespan)
         self.macd = macd
         self.ma_calculation = list(ma_calculation)
         self.vma_calculation = list(vma_calculation)
@@ -136,17 +174,48 @@ class Strategy:
             "totalprice": pd.Series(dtype="float64"),
         })
         ##dataframe storing comprehensive transaction details
-
     def initialize(self):
         for stock in self.port:
             loaded = stock.loadfromdatabase()
             if loaded:
                 stock.update()
+                indicator_columns = [
+                    "DIF",
+                    "DEA",
+                    "MACD",
+                    "goldencross",
+                    "deadcross",
+                    *[f"MA{window}" for window in self.ma_calculation],
+                    *[f"VMA{window}" for window in self.vma_calculation],
+                ]
+                if not set(indicator_columns).issubset(stock.data.columns):
+                    stock.calculateallIndex(macd=self.macd_calculation, ma=self.ma_calculation,
+                                            vma=self.vma_calculation)
+                    stock.committodatabase()
+                else:
+                    missing_rows = stock.data[indicator_columns].isna().any(axis=1)
+                    if missing_rows.any():
+                        first_missing_date = stock.data.index[missing_rows][0]
+                        stock.calculateallIndex(
+                            macd=self.macd_calculation,
+                            ma=self.ma_calculation,
+                            vma=self.vma_calculation,
+                            start_timestamp=first_missing_date,
+                            )
+                    stock.committodatabase()
             else:
                 stock.download(timespan=self.timespan)
-            stock.calculateallIndex(macd = self.macd_calculation, ma = self.ma_calculation, vma = self.vma_calculation)
-            stock.committodatabase()
+                stock.calculateallIndex(macd = self.macd_calculation,ma = self.ma_calculation,vma = self.vma_calculation)
+                stock.committodatabase()
             self.transactions.loc[stock.name] = [0.0,0,pd.Timestamp.today().normalize(),0.0]
+        for index in stockindex:
+            index_stock = Stock(index)
+            loaded = index_stock.loadfromdatabase()
+            if loaded:
+                index_stock.update()
+            else:
+                index_stock.download(timespan=self.timespan)
+            index_stock.committodatabase()
             ## initialize transactions dataframe, add more attributes later
     def buy(self, chosenstock: Stock,date: int, price: float, volume: int) -> bool:
         if volume == 0:
@@ -205,7 +274,12 @@ class Strategy:
         return closing_prices
     ##read the factor and execute it to get the corresponding data
     def readandexecute(self):
-        all_dates = sorted(set().union(*(set(stock.data.index)for stock in self.port)))
+        all_dates = sorted({
+            current_date
+            for stock in self.port
+            for current_date in stock.data.index
+            if current_date >= self.start_date
+        })
         closing_prices = self.prepare_closing_price(all_dates)
         minimum_history = 34
         for i in all_dates:
@@ -224,9 +298,9 @@ class Strategy:
                 macd_signal = (
                         "macd" in self.factorusage
                         and previous["goldencross"]
-                        and -self.macd < previous["DIF"] < self.macd
-                        and before_previous["DEA"] < 0.5 ##ensure the purchase is after a sudden golden cross
-                        and before_previous["DIF"] < 0.5
+                        and -self.macd[0] < previous["DIF"] < self.macd[0]
+                        and before_previous["DEA"] < self.macd[1] ##ensure the purchase is after a sudden golden cross
+                        and before_previous["DIF"] < self.macd[1]
                         and previous["VMA{}".format(self.vma_calculation[0])] > previous["VMA{}".format(self.vma_calculation[1])]
                         and before_previous["VMA{}".format(self.vma_calculation[0])] <= before_previous["VMA{}".format(self.vma_calculation[1])]
                         and row["Open"] >= previous["Close"] * 0.99
@@ -255,7 +329,7 @@ class Strategy:
                     macd_signal = (
                         "macd" in self.factorusage
                         and previous["deadcross"]
-                        and (previous["DEA"] < -0.5 or previous["DEA"] > 0.5)
+                        and (previous["DEA"] < -self.macd[1] or previous["DEA"] > self.macd[1])
                     )
                     boughtprice = self.transactions.loc[st.name,"averageprice"]
                     targetprice = boughtprice * self.target
@@ -268,7 +342,7 @@ class Strategy:
                     partiallots = max(1, int(lots)) if lots else 0
                     if reversed_devour_signal or macd_signal: ##make stop of losing
                         self.sell(st,rl,open_price,lots)
-                    if open_price <= stopprice:
+                    elif open_price <= stopprice:
                         self.sell(st,rl,open_price,lots)
                     elif open_price >= targetprice:
                         if partiallots > 0:
@@ -285,6 +359,7 @@ class Strategy:
                 close = closing_prices.loc[i,st.name]
                 if pd.notna(close):
                     position_value += shares*close
+
             portfolio_value = position_value+self.money
             self.equity_curve.loc[i] = [
                 self.money,
@@ -292,9 +367,11 @@ class Strategy:
                 portfolio_value,
                 portfolio_value-self.initial_money,
             ]
-        p = 0
-        monthly_profit = self.equity_curve["profit"].resample("ME").last().diff()
+        monthly_cumulative_profit = self.equity_curve["profit"].resample("ME").last()
+        monthly_profit = monthly_cumulative_profit.diff()
+        monthly_profit.iloc[0] = monthly_cumulative_profit.iloc[0]
         print(monthly_profit)
+        print(self.transactions)
     def showresult(self):
         fig, ax = plt.subplots(figsize=(12,6))
         ax.plot(
@@ -320,15 +397,16 @@ class Strategy:
         plt.show()
 
 def backtest():
-    teststocklist = []
-    for i in stockdic.keys():
-        teststocklist.append(Stock(i))
-    teststrategy = Strategy(teststocklist,"2y",100000,["macd","devour","ma"])
+    tradable_names = ['gyfl', 'zgly', 'lxjm', 'hgkj', 'sydl']
+    teststocklist = [Stock(name) for name in tradable_names]
+    teststrategy = Strategy(teststocklist,"2y",100000,["macd","devour","ma"],stop = 0.95,target=1.5) ##modify timespan, buying, selling, and signal logic
     teststrategy.initialize()
     teststrategy.readandexecute()
     teststrategy.showresult()
 if __name__ == "__main__":
     backtest()
+
+
 
 
 
