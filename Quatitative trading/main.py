@@ -72,27 +72,47 @@ class Stock:
             return False
         self.data = data.sort_index()
         return True
-    def update(self):  ##handle the case where the data is stale
+    def update(self,start_date ):  ##handle the case where the data is stale
         if not self.loadfromdatabase():
             return False
         latest_date = self.data.index.max()
+        earliest_date= self.data.index.min()
+        changed = False
         next_date = latest_date + pd.Timedelta(days=1)
         today = pd.Timestamp.today().normalize()
-        if next_date > today:
-            return
-        new_data = yf.download(
-            stockdic[self.name],
-            start=next_date,
-            end=(today + pd.Timedelta(days=1)),
-            multi_level_index=False,
-            progress=False,
-            session=session,
-        )
-        if new_data.empty:
-            return True
-        new_data = new_data[new_data.index > latest_date]
-        self.data = pd.concat([self.data,new_data]).sort_index()
-        return True
+        forwarddata = pd.DataFrame()
+        if next_date<=today:
+            new_data = yf.download(
+                stockdic[self.name],
+                start=next_date,
+                end=(today + pd.Timedelta(days=1)),
+                multi_level_index=False,
+                auto_adjust=True,
+                progress=False,
+                session=session,
+            )
+            if not new_data.empty:
+                new_data = new_data[new_data.index > latest_date]
+                if not new_data.empty:
+                    self.data = pd.concat([self.data,new_data]).sort_index()
+                changed = True
+        startdate = pd.Timestamp(start_date)
+        if startdate < earliest_date:
+            forwarddata = yf.download(
+                stockdic[self.name],
+                start=startdate,
+                end=earliest_date,
+                multi_level_index=False,
+                auto_adjust=True,
+                progress=False,
+                session=session,
+            )
+            if not forwarddata.empty:
+                forwarddata = forwarddata[forwarddata.index < earliest_date]
+                if not forwarddata.empty:
+                    self.data = pd.concat([self.data,forwarddata]).sort_index()
+                changed = True
+        return changed
     def calculateallIndex(self,macd = [10,23,8],ma = [5,20],vma = [5,20],start_timestamp = None, warmup = 200):
         self.data = self.data.sort_index()
         if start_timestamp is None:
@@ -162,7 +182,8 @@ class Strategy:
             "averageprice": pd.Series(dtype="float64"),
             "volume": pd.Series(dtype="int64"),
             "date": pd.Series(dtype="datetime64[ns]"),
-            "profit": pd.Series(dtype="float64"),
+            "unrealizedprofit": pd.Series(dtype="float64"),
+            "realizedprofit": pd.Series(dtype="float64"),
         })
         ## name as index, indicating bought average price and bought v newest bought date, and totalprofit for each stock
         self.operations = pd.DataFrame({
@@ -178,7 +199,7 @@ class Strategy:
         for stock in self.port:
             loaded = stock.loadfromdatabase()
             if loaded:
-                stock.update()
+                stock.update(start_date=self.start_date)
                 indicator_columns = [
                     "DIF",
                     "DEA",
@@ -207,12 +228,12 @@ class Strategy:
                 stock.download(timespan=self.timespan)
                 stock.calculateallIndex(macd = self.macd_calculation,ma = self.ma_calculation,vma = self.vma_calculation)
                 stock.committodatabase()
-            self.transactions.loc[stock.name] = [0.0,0,pd.Timestamp.today().normalize(),0.0]
+            self.transactions.loc[stock.name] = [0.0,0,pd.Timestamp.today().normalize(),0.0,0.0]
         for index in stockindex:
             index_stock = Stock(index)
             loaded = index_stock.loadfromdatabase()
             if loaded:
-                index_stock.update()
+                index_stock.update(self.start_date)
             else:
                 index_stock.download(timespan=self.timespan)
             index_stock.committodatabase()
@@ -236,7 +257,6 @@ class Strategy:
         self.transactions.loc[sn,"volume"] +=volume*100
         self.transactions.loc[sn,"averageprice"] = (old_price*old_volume+price*volume*100) / (old_volume+volume*100)
         self.transactions.loc[sn,"date"] = chosenstock.data.index[date]
-        self.transactions.loc[sn,"profit"] -= price*volume*100
         name = chosenstock.name
         actualdate = chosenstock.data.index[date]
         print(f"Buy {name} at {actualdate}, {volume} in price {price}, total price {volume*100*price}")
@@ -251,13 +271,13 @@ class Strategy:
             return False
         self.money += price*volume*100
         self.totalprofit += price * volume*100
-        self.transactions.loc[sn, "profit"] += price * volume * 100
         newrow = {"name": chosenstock.name,"date" : chosenstock.data.index[date],"price" : price,"volume" : volume*100,"buy" : False}
         self.operations = pd.concat([self.operations,pd.DataFrame([newrow])],ignore_index = True)
         lastindex = self.operations.index[-1]
         self.operations.loc[lastindex, "totalprice"] = -price * volume * 100
         old_volume = self.transactions.loc[sn,"volume"]
         old_price = self.transactions.loc[sn,"averageprice"]
+        self.transactions.loc[sn,"realizedprofit"] += price*volume*100 - old_price*volume*100
         self.transactions.loc[sn,"volume"] -=volume*100
         if volume*100 == old_volume:
             self.transactions.loc[sn,"averageprice"] = 0
@@ -359,7 +379,7 @@ class Strategy:
                 close = closing_prices.loc[i,st.name]
                 if pd.notna(close):
                     position_value += shares*close
-
+                self.transactions.loc[st.name,"unrealizedprofit"] = shares*close - self.transactions.loc[st.name,"averageprice"]*shares
             portfolio_value = position_value+self.money
             self.equity_curve.loc[i] = [
                 self.money,
@@ -395,6 +415,39 @@ class Strategy:
         ax.legend()
         plt.tight_layout()
         plt.show()
+    def showstock(self,chosenstock):
+        name = chosenstock.name if hasattr(chosenstock,"name") else chosenstock.name
+        fig, ax = plt.subplots(figsize=(12,6))
+        operations = self.operations[
+            self.operations["name"] == name
+        ].copy()
+        if operations.empty:
+            print(f"No operations for {name}")
+            return
+        buys = operations[operations["buy"]]
+        sells = operations[~operations["buy"]]
+        ax.scatter(
+            buys["date"],
+            buys["price"],
+            marker="^",
+            color="green",
+            label="Buy",
+        )
+        ax.scatter(
+            sells["date"],
+            sells["price"],
+            marker="v",
+            color="red",
+            label="Sell",
+        )
+        ax.set_title(f"Buys and sells for {name}")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price")
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
 
 def backtest():
     tradable_names = ['gyfl', 'zgly', 'lxjm', 'hgkj', 'sydl']
@@ -403,6 +456,7 @@ def backtest():
     teststrategy.initialize()
     teststrategy.readandexecute()
     teststrategy.showresult()
+    teststrategy.showstock(Stock("zgly"))
 if __name__ == "__main__":
     backtest()
 
